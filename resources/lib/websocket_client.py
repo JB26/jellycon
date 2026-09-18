@@ -5,6 +5,7 @@ from __future__ import (
 import json
 import threading
 import time
+import traceback
 
 import xbmc
 import xbmcaddon
@@ -20,22 +21,34 @@ from .utils import load_user_details
 
 log = LazyLogger(__name__)
 
+# Heartbeat watchdog. We subscribe to a periodic server push (ScheduledTasks
+# info) so the server is guaranteed to send us something on a known interval.
+# If nothing arrives for HEARTBEAT_TIMEOUT seconds the connection is treated as
+# dead and torn down so the reconnect loop runs. This detects a stale
+# ("half-open") socket - e.g. after a NAT/firewall idle timeout or IP change -
+# that otherwise leaves run_forever() blocked forever. It uses ordinary data
+# messages rather than WebSocket ping frames, so the Jellyfin server does not
+# log them (the spam that caused ping_interval to be reverted in d312241).
+HEARTBEAT_PERIOD_MS = 30000
+HEARTBEAT_CHECK = 30
+HEARTBEAT_TIMEOUT = 90
+
 
 class WebSocketClient(threading.Thread):
 
-    _shared_state = {}
-
-    _client = None
-    _stop_websocket = False
-    _library_monitor = None
-
     def __init__(self, library_change_monitor):
 
-        self.__dict__ = self._shared_state
+        threading.Thread.__init__(self)
+
+        self._client = None
+        self._stop_websocket = False
+        self._library_monitor = library_change_monitor
         self.monitor = xbmc.Monitor()
 
-        self._library_monitor = library_change_monitor
         self.websocket_error = False
+        self.last_message_time = time.time()
+        self._watchdog_timer = None
+        self._keepalive_timer = None
         settings = xbmcaddon.Addon()
         user_details = load_user_details()
 
@@ -45,35 +58,42 @@ class WebSocketClient(threading.Thread):
             user_details.get('token')
         )
 
-        threading.Thread.__init__(self)
-
     def on_message(self, ws, message):
 
-        result = json.loads(message)
-        message_type = result['MessageType']
+        # Any inbound traffic proves the connection is still alive.
+        self.last_message_time = time.time()
 
-        if message_type == 'Play':
-            data = result['Data']
-            self._play(data)
+        try:
+            result = json.loads(message)
+            message_type = result['MessageType']
 
-        elif message_type == 'Playstate':
-            data = result['Data']
-            self._playstate(data)
+            if message_type == 'Play':
+                data = result['Data']
+                self._play(data)
 
-        elif message_type == "UserDataChanged":
-            data = result['Data']
-            self._library_changed(data)
+            elif message_type == 'Playstate':
+                data = result['Data']
+                self._playstate(data)
 
-        elif message_type == "LibraryChanged":
-            data = result['Data']
-            self._library_changed(data)
+            elif message_type == "UserDataChanged":
+                data = result['Data']
+                self._library_changed(data)
 
-        elif message_type == "GeneralCommand":
-            data = result['Data']
-            self._general_commands(data)
+            elif message_type == "LibraryChanged":
+                data = result['Data']
+                self._library_changed(data)
 
-        else:
-            log.debug("WebSocket Message Type: {0}".format(message))
+            elif message_type == "GeneralCommand":
+                data = result['Data']
+                self._general_commands(data)
+
+            else:
+                log.debug("WebSocket Message Type: {0}".format(message))
+
+        except Exception:
+            log.error(
+                "Exception processing WebSocket message:\n{0}".format(
+                    traceback.format_exc()))
 
     def _library_changed(self, data):
         log.debug("Library_Changed: {0}".format(data))
@@ -236,17 +256,22 @@ class WebSocketClient(threading.Thread):
                 xbmc.executebuiltin(builtin[command])
 
     def on_open(self, ws):
-        # Wait to make sure previous keepalive cycle has ended
-        if self.websocket_error:
-            time.sleep(30)
-            self.websocket_error = False
         log.debug("Connected")
+        self.last_message_time = time.time()
         self.api.post_capabilities()
+        self._cancel_timers()
         self.send_keepalive(ws)
+        self.subscribe_heartbeat(ws)
+        self.schedule_watchdog(ws)
 
     def on_error(self, ws, error):
         self.websocket_error = True
-        log.debug("Error: {0}".format(error))
+        log.error("WebSocket error: {0}".format(error))
+
+    def on_close(self, ws, close_status_code=None, close_msg=None):
+        log.debug(
+            "WebSocket closed (code={0}, reason={1})".format(
+                close_status_code, close_msg))
 
     def run(self):
 
@@ -265,19 +290,32 @@ class WebSocketClient(threading.Thread):
         websocket_url = "{}/socket".format(server)
         log.debug("websocket url: {0}".format(websocket_url))
 
-        headers = self.api.headers
-        self._client = websocket.WebSocketApp(
-            websocket_url,
-            header=headers,
-            on_open=lambda ws: self.on_open(ws),
-            on_message=lambda ws, message: self.on_message(ws, message),
-            on_error=lambda ws, error: self.on_error(ws, error))
-
         log.debug("Starting WebSocketClient")
 
         while not self.monitor.abortRequested():
 
-            self._client.run_forever(reconnect=30)
+            self.websocket_error = False
+            self._cancel_timers()
+
+            headers = self.api.headers
+            self._client = websocket.WebSocketApp(
+                websocket_url,
+                header=headers,
+                on_open=lambda ws: self.on_open(ws),
+                on_message=lambda ws, message: self.on_message(ws, message),
+                on_error=lambda ws, error: self.on_error(ws, error),
+                on_close=lambda ws, code, reason: self.on_close(
+                    ws, code, reason))
+
+            log.debug("Opening WebSocket connection")
+            try:
+                self._client.run_forever()
+            except Exception:
+                log.error(
+                    "WebSocket loop failed:\n{0}".format(
+                        traceback.format_exc()))
+
+            log.debug("WebSocket connection ended")
 
             if self._stop_websocket:
                 break
@@ -293,20 +331,26 @@ class WebSocketClient(threading.Thread):
     def stop_client(self):
 
         self._stop_websocket = True
+        self._cancel_timers()
         if self._client is not None:
             self._client.close()
         log.debug("Stopping WebSocket (stop_client called)")
 
     def send_keepalive(self, ws):
         # Stop the keepalive cycle if an error has been detected
-        if self.websocket_error:
+        if self.websocket_error or ws is not self._client:
             return
         keepalive_payload = json.dumps({"MessageType": "KeepAlive", "Data": 30})
         # Send the keepalive, or register an error
         try:
             ws.send(keepalive_payload)
-        except:
+        except Exception as error:
             self.websocket_error = True
+            log.error("WebSocket keepalive failed: {0}".format(error))
+            try:
+                ws.close()
+            except Exception:
+                pass
             return
         # Schedule the next message
         self.schedule_keepalive(ws)
@@ -315,3 +359,54 @@ class WebSocketClient(threading.Thread):
         # Schedule a keepalive message in 30 seconds
         timer = threading.Timer(30, self.send_keepalive, kwargs={'ws': ws})
         timer.start()
+        self._keepalive_timer = timer
+
+    def _cancel_timers(self):
+        if self._watchdog_timer:
+            self._watchdog_timer.cancel()
+            self._watchdog_timer = None
+        if self._keepalive_timer:
+            self._keepalive_timer.cancel()
+            self._keepalive_timer = None
+
+    def subscribe_heartbeat(self, ws):
+        # Ask the server to push ScheduledTasksInfo every HEARTBEAT_PERIOD_MS.
+        # Data is "dueTimeMs,periodMs"; this gives us a steady inbound signal
+        # that the watchdog can use to detect a dead connection.
+        payload = json.dumps({
+            "MessageType": "ScheduledTasksInfoStart",
+            "Data": "0,{0}".format(HEARTBEAT_PERIOD_MS),
+        })
+        try:
+            ws.send(payload)
+        except Exception as error:
+            log.error(
+                "Failed to subscribe to WebSocket heartbeat: {0}".format(
+                    error))
+
+    def schedule_watchdog(self, ws):
+        # Check connection liveness in HEARTBEAT_CHECK seconds
+        timer = threading.Timer(
+            HEARTBEAT_CHECK, self.check_watchdog, kwargs={'ws': ws})
+        timer.start()
+        self._watchdog_timer = timer
+
+    def check_watchdog(self, ws):
+        # Stop stale timers from previous connections / after shutdown
+        if self._stop_websocket or ws is not self._client:
+            return
+        elapsed = time.time() - self.last_message_time
+        if elapsed > HEARTBEAT_TIMEOUT:
+            # No inbound traffic for too long - the socket is most likely
+            # half-open. Close it so the blocked run_forever() returns and
+            # the reconnect loop runs.
+            log.debug(
+                "Watchdog: no message for {0:.0f}s, reconnecting".format(
+                    elapsed))
+            try:
+                ws.close()
+            except Exception:
+                pass
+            return
+        # Still alive - keep watching
+        self.schedule_watchdog(ws)
